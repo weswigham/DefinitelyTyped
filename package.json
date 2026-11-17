@@ -18,6 +18,7 @@
     "scripts": {
         "preinstall": "npx only-allow pnpm",
         "not-needed": "node scripts/not-needed.js",
+        "remove-bundled-types": "node scripts/remove-bundled-types.js",
         "update-codeowners": "node scripts/update-codeowners.js",
         "test-all": "node --enable-source-maps node_modules/@definitelytyped/dtslint-runner/ --path .",
         "clean": "node scripts/remove-empty.js",

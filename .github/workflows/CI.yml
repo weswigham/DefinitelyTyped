@@ -142,3 +142,4 @@ jobs:
       - uses: ./.github/actions/setup-for-scripts
 
       - run: pnpm tsc -p ./scripts
+      - run: pnpm --dir scripts test

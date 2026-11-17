@@ -26,7 +26,8 @@ fs.writeFileSync("notNeededPackages.json", JSON.stringify(notNeededPackages, und
 
 /**  @type  {{ failingPackages: string[] }} */
 const attw = JSON.parse(fs.readFileSync("attw.json", "utf-8"));
-const packageWithOptionalVersionRegex = new RegExp(`^${typingsPackageName}(/v\\d+)?$`);
+const escapedPackageName = typingsPackageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const packageWithOptionalVersionRegex = new RegExp(`^${escapedPackageName}(/v\\d+)?$`);
 attw.failingPackages = attw.failingPackages.filter((failingPackage) => (
     !packageWithOptionalVersionRegex.test(failingPackage)
 ));

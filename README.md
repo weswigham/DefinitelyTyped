@@ -212,6 +212,9 @@ You can remove it by running `pnpm run not-needed <typingsPackageName> <asOfVers
 
 If a package was never on Definitely Typed, it does not need to be added to `notNeededPackages.json`.
 
+The weekly [bundled-types workflow](.github/workflows/remove-bundled-types.yml) automates these removals for npm-backed packages with at most 200,000 monthly downloads of their `@types` package, excluding the mergebot's Popular and Critical categories. You can run the [script](scripts/remove-bundled-types.js) locally with `pnpm run remove-bundled-types`; it requires a clean working tree and a configured Git identity, and makes local commits without pushing.
+Run its tests with `pnpm --dir scripts test`.
+
 #### Running tests
 
 Test your changes by running `pnpm test <package to test>` where `<package to test>` is the name of your package.
