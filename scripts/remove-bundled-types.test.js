@@ -5,9 +5,16 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { gzipSync } from "node:zlib";
-import { Header } from "tar";
-import { createNpmFetch, findRemovals, hasBundledTypes, main, pullRequestBody } from "./remove-bundled-types.js";
+import pacote from "pacote";
+import {
+    createCachedTypesMetadata,
+    createNpmFetch,
+    findRemovals,
+    hasBundledTypes,
+    main,
+    pullRequestBody,
+    runCli,
+} from "./remove-bundled-types.js";
 
 /**
  * @param {string} path
@@ -171,23 +178,12 @@ function mockRegistry(responses) {
         const url = requestUrl(input);
         requests.push(url);
         const headers = new Headers(options?.headers ?? (input instanceof Request ? input.headers : undefined));
-        assert.equal(headers.get("accept"), url.endsWith(".tgz") ? null : "application/json");
+        assert.equal(headers.get("accept"), "application/json");
         assert.ok(Object.hasOwn(responses, url), `Unexpected request: ${url}`);
         const response = responses[url];
         return response instanceof Response ? response.clone() : Response.json(response);
     };
     return { fetcher, requests };
-}
-
-/** @param {string[]} fileNames */
-function packageTarball(fileNames) {
-    const blocks = fileNames.map(path => {
-        const header = new Header({ path: `package/${path}`, size: 0, mode: 0o644, type: "File" });
-        header.encode();
-        assert.ok(header.block);
-        return header.block;
-    });
-    return new Uint8Array(gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)])));
 }
 
 /**
@@ -207,13 +203,11 @@ function npmResponses(
     } = {},
 ) {
     const library = name.includes("__") ? `@${name.replace("__", "/")}` : name;
-    const tarball = `https://registry.npmjs.org/${encodeURIComponent(library)}/-/${name}-${version}.tgz`;
     return {
         [`https://registry.npmjs.org/${encodeURIComponent(library)}/latest`]: {
             name: library,
             version,
             types: "index.d.ts",
-            dist: { tarball },
             ...manifest,
         },
         [`https://api.npmjs.org/downloads/point/last-month/@types/${name}`]: { downloads },
@@ -221,9 +215,136 @@ function npmResponses(
             versions: Object.fromEntries(versions.map(published => [published, {}])),
             "dist-tags": tags,
         },
-        [tarball]: new Response(packageTarball(["package.json", ...files])),
+        [`https://unpkg.com/${library}@${version}/?meta`]: {
+            package: library,
+            version,
+            prefix: "/",
+            files: ["package.json", ...files].map(path => ({ path: `/${path}` })),
+        },
     };
 }
+
+test("paces concurrent download requests to three per minute without pacing registry metadata", async () => {
+    let now = 0;
+    /** @type {{ url: string; time: number }[]} */
+    const starts = [];
+    /** @type {number[]} */
+    const delays = [];
+    const client = createNpmFetch(
+        async input => {
+            starts.push({ url: requestUrl(input), time: now });
+            return Response.json({ downloads: 0 });
+        },
+        async ms => {
+            delays.push(ms);
+            now += ms;
+        },
+        () => now,
+    );
+    await Promise.all([
+        client("https://api.npmjs.org/downloads/point/last-month/@types/first"),
+        client("https://registry.npmjs.org/first/latest"),
+        client("https://api.npmjs.org/downloads/point/last-month/@types/second"),
+        client("https://api.npmjs.org/downloads/point/last-month/@types/third"),
+        client("https://api.npmjs.org/downloads/point/last-month/@types/fourth"),
+    ]);
+    assert.deepEqual(starts.filter(start => start.url.startsWith("https://api.npmjs.org/")).map(start => start.time), [
+        0,
+        20_000,
+        40_000,
+        60_000,
+    ]);
+    assert.equal(starts.find(start => start.url.startsWith("https://registry.npmjs.org/"))?.time, 0);
+    assert.deepEqual(delays, [20_000, 20_000, 20_000]);
+});
+
+test("paces download retries even when Retry-After requests an immediate retry", async () => {
+    let now = 0;
+    /** @type {number[]} */
+    const starts = [];
+    const client = createNpmFetch(
+        async () => {
+            starts.push(now);
+            return starts.length === 1
+                ? new Response(null, { status: 429, headers: { "Retry-After": "0" } })
+                : Response.json({ downloads: 0 });
+        },
+        async ms => {
+            now += ms;
+        },
+        () => now,
+    );
+    assert.equal((await client("https://api.npmjs.org/downloads/point/last-month/@types/first")).status, 200);
+    assert.deepEqual(starts, [0, 20_000]);
+});
+
+test("shares download Retry-After cooldowns with queued requests without blocking registry metadata", async context => {
+    const date = Date.UTC(2030, 0, 1);
+    context.mock.method(Date, "now", () => date);
+    for (const retryAfter of ["120", new Date(date + 120_000).toUTCString()]) {
+        await context.test(retryAfter, async () => {
+            let now = 0;
+            let attempts = 0;
+            /** @type {{ url: string; time: number }[]} */
+            const starts = [];
+            const client = createNpmFetch(
+                async input => {
+                    const url = requestUrl(input);
+                    starts.push({ url, time: now });
+                    return url.endsWith("/first") && attempts++ === 0
+                        ? new Response(null, { status: 429, headers: { "Retry-After": retryAfter } })
+                        : Response.json({ downloads: 0 });
+                },
+                async ms => {
+                    now += ms;
+                },
+                () => now,
+            );
+            await Promise.all([
+                client("https://api.npmjs.org/downloads/point/last-month/@types/first"),
+                client("https://api.npmjs.org/downloads/point/last-month/@types/second"),
+                client("https://registry.npmjs.org/first/latest"),
+            ]);
+            const downloads = starts.filter(start => start.url.startsWith("https://api.npmjs.org/"));
+            assert.equal(downloads.length, 3);
+            assert.equal(downloads[0].time, 0);
+            assert.ok(downloads[1].time >= 120_000);
+            assert.ok(downloads[2].time - downloads[1].time >= 20_000);
+            assert.equal(starts.find(start => start.url.startsWith("https://registry.npmjs.org/"))?.time, 0);
+        });
+    }
+});
+
+test("keeps the shared download cooldown when the rate-limited caller aborts", async () => {
+    let now = 0;
+    /** @type {number[]} */
+    const starts = [];
+    const controller = new AbortController();
+    const client = createNpmFetch(
+        async () => {
+            starts.push(now);
+            return starts.length === 1
+                ? new Response(null, { status: 429, headers: { "Retry-After": "120" } })
+                : Response.json({ downloads: 0 });
+        },
+        async (ms, signal) => {
+            if (signal === controller.signal) {
+                controller.abort();
+                signal.throwIfAborted();
+            }
+            now += ms;
+        },
+        () => now,
+    );
+    await assert.rejects(
+        client("https://api.npmjs.org/downloads/point/last-month/@types/first", {
+            signal: controller.signal,
+        }),
+        { name: "AbortError" },
+    );
+    await client("https://api.npmjs.org/downloads/point/last-month/@types/second");
+    assert.deepEqual(starts, [0, 120_000]);
+});
 
 test("native fetch honors Retry-After seconds and dates with a fresh timeout for each attempt", async t => {
     const now = Date.UTC(2030, 0, 1);
@@ -298,7 +419,7 @@ test("native fetch waits for Retry-After over a real HTTP connection", async t =
     assert.ok(attempts[1] - attempts[0] >= 1_000);
 });
 
-test("retries every npm endpoint, including downloads and streamed tarballs", async t => {
+test("retries every endpoint, including npm downloads and UNPKG metadata", async t => {
     const root = fixture(t, { implicit: {} });
     const { fetcher, requests } = mockRegistry(npmResponses("implicit", { manifest: { types: undefined } }));
     /** @type {Map<string, number>} */
@@ -478,7 +599,7 @@ test("resolves implicit declarations beside default, main, and conditional expor
     );
 });
 
-test("discovers implicit types from real tarball file lists, not package.json file whitelists", async t => {
+test("discovers implicit types from UNPKG file lists, not package.json file whitelists", async t => {
     const root = fixture(t, { implicit: {}, main: {}, whitelist: {}, fixture: {} });
     const { fetcher, requests } = mockRegistry({
         ...npmResponses("implicit", { manifest: { types: undefined } }),
@@ -493,7 +614,8 @@ test("discovers implicit types from real tarball file lists, not package.json fi
         { typingsPackageName: "implicit", libraryName: "implicit", asOfVersion: "2.0.0" },
         { typingsPackageName: "main", libraryName: "main", asOfVersion: "2.0.0" },
     ]);
-    assert.equal(requests.filter(url => url.endsWith(".tgz")).length, 4);
+    assert.equal(requests.filter(url => url.startsWith("https://unpkg.com/")).length, 4);
+    assert.ok(requests.every(url => !url.endsWith(".tgz")));
 });
 
 test("finds unscoped and scoped packages, skipping non-npm declarations and old version directories", async t => {
@@ -512,6 +634,327 @@ test("finds unscoped and scoped packages, skipping non-npm declarations and old 
     assert.equal(requests.length, 8);
     assert.ok(requests.includes("https://registry.npmjs.org/%40scope%2Fsecond/latest"));
     assert.ok(requests.includes("https://api.npmjs.org/downloads/point/last-month/@types/scope__second"));
+    assert.ok(requests.includes("https://unpkg.com/first@2.0.0/?meta"));
+    assert.ok(requests.includes("https://unpkg.com/@scope/second@2.0.0/?meta"));
+});
+
+test("partitions packages exactly once across twenty shards and keeps assignments stable when packages are added", async t => {
+    const shardCount = 20;
+    const names = Array.from({ length: 23 }, (_, index) => `package-${String(index).padStart(2, "0")}`);
+    const root = fixture(t, {
+        ...Object.fromEntries(names.map(name => [name, {}])),
+        browser: { nonNpm: true },
+    });
+    const { fetcher, requests } = mockRegistry(
+        Object.assign({}, npmResponses("aaa-new-package"), ...names.map(name => npmResponses(name))),
+    );
+    const shards = [];
+    const assignments = new Map();
+    for (let shardIndex = 0; shardIndex < shardCount; shardIndex++) {
+        const removals = await findRemovals(root, fetcher, { shardIndex, shardCount });
+        for (const removal of removals) {
+            assignments.set(removal.typingsPackageName, shardIndex);
+        }
+        shards.push(...removals.map(removal => removal.typingsPackageName));
+    }
+    assert.deepEqual(shards.sort(), names);
+    assert.equal(new Set(requests).size, requests.length);
+
+    mkdirSync(join(root, "types", "aaa-new-package"));
+    writeJson(join(root, "types", "aaa-new-package", "package.json"), { name: "@types/aaa-new-package" });
+    let added = 0;
+    for (let shardIndex = 0; shardIndex < shardCount; shardIndex++) {
+        const removals = await findRemovals(root, fetcher, { shardIndex, shardCount });
+        for (const removal of removals) {
+            if (removal.typingsPackageName === "aaa-new-package") {
+                added++;
+            } else {
+                assert.equal(assignments.get(removal.typingsPackageName), shardIndex);
+            }
+        }
+    }
+    assert.equal(added, 1);
+});
+
+test("rejects invalid shard indices and counts before querying npm", async t => {
+    const root = fixture(t, { first: {} });
+    const { fetcher, requests } = mockRegistry({});
+    for (
+        const options of [
+            { shardCount: 0 },
+            { shardCount: 1.5 },
+            { shardIndex: -1 },
+            { shardIndex: 1, shardCount: 1 },
+            { shardIndex: 0.5 },
+        ]
+    ) {
+        await assert.rejects(findRemovals(root, fetcher, options), /shardIndex < shardCount/);
+    }
+    assert.deepEqual(requests, []);
+});
+
+test("scans without changing the checkout and combines shards into one revalidated removal run", async t => {
+    const root = fixture(t, { first: {}, second: {}, unrelated: {} });
+    const commit = initializeGit(root);
+    const { fetcher, requests } = mockRegistry({
+        ...npmResponses("first"),
+        ...npmResponses("second"),
+        ...npmResponses("unrelated", { files: ["index.js"] }),
+    });
+    const directory = join(root, ".test-state", "candidates");
+    mkdirSync(directory, { recursive: true });
+    for (let shardIndex = 0; shardIndex < 2; shardIndex++) {
+        const result = await runCli(
+            [
+                "--scan",
+                "--shard-index",
+                String(shardIndex),
+                "--shard-count",
+                "2",
+            ],
+            root,
+            fetcher,
+        );
+        assert.ok(result);
+        const scan = JSON.parse(result);
+        assert.equal(scan.commit, commit);
+        assert.equal(scan.shardIndex, shardIndex);
+        assert.equal(scan.shardCount, 2);
+        writeJson(join(directory, `${shardIndex}.json`), scan);
+    }
+    assert.equal(git(root, "rev-parse", "HEAD"), commit);
+    assert.equal(git(root, "status", "--porcelain"), "");
+    assert.equal(existsSync(join(root, ".test-state", "commands.jsonl")), false);
+
+    const checkedBefore = requests.length;
+    const body = await runCli(["--candidates", directory], root, fetcher, join(root, "scripts", "pnpm.cjs"));
+    assert.ok(body);
+    assert.ok(body.includes("This run removes **2** declaration packages."));
+    assert.equal(git(root, "rev-list", "--count", `${commit}..HEAD`), "2");
+    assert.ok(requests.slice(checkedBefore).every(url => !url.includes("unrelated")));
+    assert.equal(requests.slice(checkedBefore).filter(url => url.includes("/downloads/")).length, 2);
+});
+
+test("runs only a single shard's candidates when partial results are explicitly allowed", async t => {
+    const root = fixture(t, { first: {}, untouched: {} });
+    const commit = initializeGit(root);
+    const directory = join(root, ".test-state", "candidates");
+    mkdirSync(directory, { recursive: true });
+    writeJson(join(directory, "0.json"), { commit, shardIndex: 0, shardCount: 20, packages: ["first"] });
+    const { fetcher } = mockRegistry(npmResponses("first"));
+    await assert.rejects(runCli(["--candidates", directory], root, fetcher), /Missing scan shard results/);
+    const body = await runCli(
+        ["--candidates", directory, "--allow-partial"],
+        root,
+        fetcher,
+        join(root, "scripts", "pnpm.cjs"),
+    );
+    assert.ok(body);
+    assert.ok(body.includes("This run removes **1** declaration packages."));
+    assert.equal(existsSync(join(root, "types", "first")), false);
+    assert.equal(existsSync(join(root, "types", "untouched")), true);
+    assert.equal(git(root, "rev-list", "--count", `${commit}..HEAD`), "1");
+    assert.equal(git(root, "status", "--porcelain"), "");
+});
+
+test("rejects empty candidate paths before querying npm or mutating the checkout", async context => {
+    const root = fixture(context, { first: {}, unrelated: {} });
+    const commit = initializeGit(root);
+    const { fetcher, requests } = mockRegistry({});
+    for (
+        const args of [
+            ["--candidates="],
+            ["--candidates", ""],
+            ["--candidates", " \t "],
+            ["--scan", "--candidates="],
+            ["--candidates=", "--allow-partial"],
+        ]
+    ) {
+        await assert.rejects(runCli(args, root, fetcher), /--candidates requires a non-empty directory path/);
+    }
+    assert.deepEqual(requests, []);
+    assert.equal(git(root, "rev-parse", "HEAD"), commit);
+    assert.equal(git(root, "status", "--porcelain"), "");
+    assert.equal(existsSync(join(root, ".test-state", "commands.jsonl")), false);
+});
+
+test("requires a candidates directory when allowing partial scan results", async () => {
+    await assert.rejects(runCli(["--allow-partial"]), /--allow-partial requires --candidates/);
+});
+
+test("rejects incomplete, inconsistent, or stale scan artifacts before querying npm", async t => {
+    const root = fixture(t, { first: {} });
+    const commit = initializeGit(root);
+    const directory = join(root, ".test-state", "candidates");
+    mkdirSync(directory, { recursive: true });
+    const { fetcher, requests } = mockRegistry({});
+    const first = { commit, shardIndex: 0, shardCount: 2, packages: ["first"] };
+    const second = { commit, shardIndex: 1, shardCount: 2, packages: [] };
+    for (
+        const scans of [
+            [],
+            [first],
+            [first, first],
+            [first, { ...second, shardCount: 3 }],
+            [first, { ...second, commit: "different-commit" }],
+            [first, { ...second, packages: ["first"] }],
+            [first, { ...second, packages: ["../outside"] }],
+        ]
+    ) {
+        for (const name of ["0.json", "1.json"]) {
+            rmSync(join(directory, name), { force: true });
+        }
+        scans.forEach((scan, index) => writeJson(join(directory, `${index}.json`), scan));
+        await assert.rejects(runCli(["--candidates", directory], root, fetcher), /scan|Duplicate package/);
+        if (scans.length === 2) {
+            await assert.rejects(
+                runCli(["--candidates", directory, "--allow-partial"], root, fetcher),
+                /scan|Duplicate package/,
+            );
+        }
+    }
+    assert.deepEqual(requests, []);
+    assert.equal(git(root, "rev-parse", "HEAD"), commit);
+});
+
+test("does not remove scan candidates whose published @types versions have advanced", async t => {
+    const root = fixture(t, { first: {} });
+    const commit = initializeGit(root);
+    const directory = join(root, ".test-state", "candidates");
+    mkdirSync(directory, { recursive: true });
+    writeJson(join(directory, "0.json"), { commit, shardIndex: 0, shardCount: 1, packages: ["first"] });
+    const { fetcher } = mockRegistry(npmResponses("first", { versions: ["1.0.0", "3.0.0"] }));
+    assert.equal(await runCli(["--candidates", directory], root, fetcher), undefined);
+    assert.equal(git(root, "rev-parse", "HEAD"), commit);
+    assert.equal(existsSync(join(root, "types", "first")), true);
+});
+
+test("uses a shared scan progress marker for cache, retry, and skip messages and resets it afterward", async context => {
+    const root = fixture(context, { first: {}, second: {} });
+    const logger = context.mock.method(console, "error", () => {});
+    const readTypesMetadata = createCachedTypesMetadata("unused", async (name, options) => {
+        if (options.offline) {
+            throw Object.assign(new Error("Not cached"), { code: "ENOTCACHED" });
+        }
+        if (name === "@types/first") {
+            throw Object.assign(new Error("Not found"), { code: "E404" });
+        }
+        return { versions: { "3.0.0": {} } };
+    });
+    const { fetcher } = mockRegistry({ ...npmResponses("first"), ...npmResponses("second") });
+    let retried = false;
+    const client = createNpmFetch(async (input, options) => {
+        if (requestUrl(input) === "https://registry.npmjs.org/second/latest" && !retried) {
+            retried = true;
+            return new Response(null, { status: 503, headers: { "Retry-After": "0" } });
+        }
+        return fetcher(input, options);
+    }, async () => {});
+    assert.deepEqual(await findRemovals(root, client, { readTypesMetadata }), []);
+    const lines = logger.mock.calls.map(call => String(call.arguments[0]));
+    assert.ok(lines.includes("[1/2] Checking @types/first"));
+    assert.ok(lines.includes("[2/2] Checking @types/second"));
+    assert.ok(lines.includes("[1/2] Fetching uncached npm metadata for @types/first"));
+    assert.ok(lines.includes("[2/2] Fetching uncached npm metadata for @types/second"));
+    assert.ok(lines.includes("[1/2] Skipping unavailable npm metadata: @types/first"));
+    assert.ok(lines.includes("[2/2] Retrying https://registry.npmjs.org/second/latest in 0ms (retry 1/5, HTTP 503)"));
+    assert.ok(lines.includes("[2/2] Skipping second@2.0.0: not newer than every published @types/second version"));
+    await readTypesMetadata("@types/outside-scan");
+    assert.equal(logger.mock.calls.at(-1)?.arguments[0], "Fetching uncached npm metadata for @types/outside-scan");
+    await assert.rejects(
+        findRemovals(root, async () => {
+            throw new Error("Scan failed");
+        }),
+        /Scan failed/,
+    );
+    await readTypesMetadata("@types/after-failure");
+    assert.equal(logger.mock.calls.at(-1)?.arguments[0], "Fetching uncached npm metadata for @types/after-failure");
+});
+
+test("scans packages serially and numbers progress after package filtering", async context => {
+    const names = Array.from({ length: 12 }, (_, index) => `package-${String(index).padStart(2, "0")}`);
+    const root = fixture(context, {
+        ...Object.fromEntries(names.map(name => [name, {}])),
+        browser: { nonNpm: true },
+    });
+    const logger = context.mock.method(console, "error", () => {});
+    const { fetcher } = mockRegistry(
+        Object.assign({}, ...names.map(name => npmResponses(name, { version: "2.0.0-beta.1" }))),
+    );
+    assert.deepEqual(await findRemovals(root, fetcher), []);
+    const lines = logger.mock.calls.map(call => String(call.arguments[0]));
+    assert.deepEqual(
+        lines.slice(1),
+        names.flatMap((name, index) => [
+            `[${index + 1}/${names.length}] Checking @types/${name}`,
+            `[${index + 1}/${names.length}] Skipping ${name}: latest is a prerelease (2.0.0-beta.1)`,
+        ]),
+    );
+});
+
+test("populates and reuses the publisher-compatible full-metadata cache without requesting cached @types metadata", async t => {
+    const root = fixture(t, { first: {} });
+    const cache = join(root, ".test-state", "pacote-cache");
+    let metadataRequests = 0;
+    const server = createServer((request, response) => {
+        metadataRequests++;
+        const name = decodeURIComponent(request.url?.slice(1) ?? "");
+        response.setHeader("Content-Type", "application/json");
+        response.setHeader("Cache-Control", "public, max-age=0");
+        if (name === "@types/missing") {
+            response.writeHead(404);
+            response.end(JSON.stringify({ error: "Not found" }));
+        } else {
+            assert.equal(name, "@types/first");
+            response.end(JSON.stringify({ name, "dist-tags": { latest: "1.0.0" }, versions: { "1.0.0": {} } }));
+        }
+    });
+    t.after(async () => {
+        server.closeAllConnections();
+        await new Promise((resolve, reject) => {
+            server.close(error => error ? reject(error) : resolve(undefined));
+        });
+    });
+    await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+            server.off("error", reject);
+            resolve(undefined);
+        });
+    });
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const registry = `http://127.0.0.1:${address.port}`;
+    const { fetcher, requests } = mockRegistry(npmResponses("first"));
+    for (let run = 0; run < 2; run++) {
+        const readTypesMetadata = createCachedTypesMetadata(
+            cache,
+            (name, options) => pacote.packument(name, { ...options, registry }),
+        );
+        assert.deepEqual(await findRemovals(root, fetcher, { readTypesMetadata }), [
+            { typingsPackageName: "first", libraryName: "first", asOfVersion: "2.0.0" },
+        ]);
+    }
+    assert.equal(metadataRequests, 1);
+    assert.equal(requests.length, 6);
+    assert.ok(!requests.includes("https://registry.npmjs.org/%40types%2Ffirst"));
+    assert.equal(requests.filter(url => url.includes("/downloads/")).length, 2);
+    const readTypesMetadata = createCachedTypesMetadata(
+        cache,
+        (name, options) => pacote.packument(name, { ...options, registry }),
+    );
+    assert.equal(await readTypesMetadata("@types/missing"), undefined);
+    assert.equal(metadataRequests, 2);
+});
+
+test("does not mistake cache errors for misses or malformed metadata for usable cache entries", async () => {
+    const failure = Object.assign(new Error("Cache unreadable"), { code: "EACCES" });
+    const unreadable = createCachedTypesMetadata("unused", async () => {
+        throw failure;
+    });
+    await assert.rejects(unreadable("@types/first"), failure);
+    const malformed = createCachedTypesMetadata("unused", async () => []);
+    await assert.rejects(malformed("@types/first"), /Invalid cached npm metadata/);
 });
 
 test("uses the strict mergebot popularity boundary, excluding Popular and Critical packages", async t => {
@@ -528,7 +971,7 @@ test("uses the strict mergebot popularity boundary, excluding Popular and Critic
     for (const downloads of [200_001, 5_000_000, 5_000_001]) {
         assert.ok(!requests.includes(`https://registry.npmjs.org/%40types%2Fdownloads-${downloads}`));
     }
-    assert.equal(requests.filter(url => url.endsWith(".tgz")).length, 3);
+    assert.equal(requests.filter(url => url.startsWith("https://unpkg.com/")).length, 3);
 });
 
 test("only retires stable latest releases newer than all published @types versions", async t => {
@@ -598,22 +1041,38 @@ test("rejects failed requests and malformed registry data", async t => {
     }
 });
 
-test("rejects unavailable or malformed tarballs instead of treating them as untyped packages", async t => {
-    const tarball = "https://registry.npmjs.org/invalid/-/invalid-2.0.0.tgz";
+test("skips unavailable UNPKG metadata and empty file lists", async t => {
+    const root = fixture(t, { missing: {}, empty: {} });
+    const { fetcher } = mockRegistry({
+        ...npmResponses("missing"),
+        ...npmResponses("empty", { files: [] }),
+        "https://unpkg.com/missing@2.0.0/?meta": new Response(null, { status: 404 }),
+        "https://unpkg.com/empty@2.0.0/?meta": { package: "empty", version: "2.0.0", prefix: "/", files: [] },
+    });
+    assert.deepEqual(await findRemovals(root, fetcher), []);
+});
+
+test("rejects failed, malformed, or mismatched UNPKG metadata", async t => {
+    const url = "https://unpkg.com/invalid@2.0.0/?meta";
+    const metadata = { package: "invalid", version: "2.0.0", prefix: "/", files: [{ path: "/index.d.ts" }] };
     for (
-        const [url, response, error] of [
-            [
-                "https://registry.npmjs.org/invalid/latest",
-                { name: "invalid", version: "2.0.0" },
-                /Missing npm tarball URL/,
-            ],
-            [tarball, new Response(null, { status: 404 }), /Tarball request failed \(404/],
-            [tarball, new Response(null), /Missing tarball response body/],
-            [tarball, new Response("not a tarball"), /Unrecognized archive format/],
+        const [response, error] of [
+            [new Response(null, { status: 503 }), /Request failed \(503/],
+            [new Response(null), /Missing JSON response body/],
+            [new Response("not JSON"), /JSON|Unexpected token/],
+            [[], /Expected an object/],
+            [{}, /Invalid UNPKG metadata/],
+            [{ ...metadata, package: "different" }, /Invalid UNPKG metadata/],
+            [{ ...metadata, version: "3.0.0" }, /Invalid UNPKG metadata/],
+            [{ ...metadata, prefix: "/dist/" }, /Invalid UNPKG metadata/],
+            [{ ...metadata, files: {} }, /Invalid UNPKG metadata/],
+            [{ ...metadata, files: [null] }, /Invalid UNPKG metadata/],
+            [{ ...metadata, files: [{ path: 0 }] }, /Invalid UNPKG metadata/],
+            [{ ...metadata, files: [{ path: "index.d.ts" }] }, /Invalid UNPKG metadata/],
         ]
     ) {
         const root = fixture(t, { invalid: {} });
-        const { fetcher } = mockRegistry({ ...npmResponses("invalid"), [String(url)]: response });
+        const { fetcher } = mockRegistry({ ...npmResponses("invalid"), [url]: response });
         assert.ok(error instanceof RegExp);
         await assert.rejects(findRemovals(root, fetcher), error);
     }

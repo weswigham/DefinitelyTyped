@@ -1,59 +1,100 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { json } from "node:stream/consumers";
-import { pipeline } from "node:stream/promises";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
+import pacote from "pacote";
 import { gt, lt, maxSatisfying, prerelease, valid, validRange } from "semver";
-import { list } from "tar";
 import ts from "typescript";
 
 // Popular and Critical packages both exceed this limit:
 // https://github.com/microsoft/DefinitelyTyped-tools/blob/a014cafa97b565021d8013e4721e8245ef3ded5e/packages/mergebot/src/pr-info.ts#L750
 const maxMonthlyDownloads = 200_000;
 const root = fileURLToPath(new URL("../", import.meta.url));
+let packageProgress = "";
+
+/** @param {string} message */
+function logPackage(message) {
+    console.error(`${packageProgress}${message}`);
+}
 
 /**
  * @param {typeof fetch} fetcher
  * @param {(ms: number, signal?: AbortSignal) => Promise<void>} wait
+ * @param {() => number} now
  * @returns {typeof fetch}
  */
-export function createNpmFetch(fetcher = fetch, wait = (ms, signal) => setTimeout(ms, undefined, { signal })) {
+export function createNpmFetch(
+    fetcher = fetch,
+    wait = (ms, signal) => setTimeout(ms, undefined, { signal }),
+    now = () => performance.now(),
+) {
+    let downloadQueue = Promise.resolve();
+    let lastDownloadRequest = -Infinity;
+    let downloadCooldownUntil = -Infinity;
     return async (input, options) => {
         const url = input instanceof Request ? input.url : String(input);
+        const parsedUrl = new URL(url);
+        const isDownloadRequest = parsedUrl.origin === "https://api.npmjs.org"
+            && parsedUrl.pathname.startsWith("/downloads/");
         const method = (options?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
         const signal = options?.signal ?? (input instanceof Request ? input.signal : undefined);
         const retryableStatuses = [408, 429, 500, 502, 503, 504];
         for (let attempt = 0;; attempt++) {
             signal?.throwIfAborted();
-            const timeout = AbortSignal.timeout(30_000);
-            const response = await fetcher(input, {
-                ...options,
-                signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-            });
-            if (
-                attempt === 5 || !["GET", "HEAD"].includes(method)
-                || !retryableStatuses.includes(response.status)
-            ) {
+            const request = async () => {
+                signal?.throwIfAborted();
+                if (isDownloadRequest) {
+                    const delay = Math.max(lastDownloadRequest + 20_000, downloadCooldownUntil) - now();
+                    if (delay > 0) {
+                        await wait(delay, signal ?? undefined);
+                    }
+                    signal?.throwIfAborted();
+                    lastDownloadRequest = now();
+                }
+                const timeout = AbortSignal.timeout(30_000);
+                const response = await fetcher(input, {
+                    ...options,
+                    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+                });
+                if (!["GET", "HEAD"].includes(method) || !retryableStatuses.includes(response.status)) {
+                    return { response };
+                }
+                const retryAfter = response.headers.get("retry-after")?.trim();
+                const requestedDelay = retryAfter === undefined
+                    ? NaN
+                    : /^\d+$/.test(retryAfter)
+                    ? Number(retryAfter) * 1_000
+                    : Date.parse(retryAfter) - Date.now();
+                if (requestedDelay > 2_147_483_647) {
+                    throw new Error(`Retry-After exceeds the supported timer duration: ${url}`);
+                }
+                const delay = Number.isFinite(requestedDelay)
+                    ? Math.max(0, requestedDelay)
+                    : Math.ceil(Math.min(60_000, 1_000 * 2 ** attempt) * (0.5 + Math.random() / 2));
+                if (isDownloadRequest) {
+                    downloadCooldownUntil = Math.max(downloadCooldownUntil, now() + delay);
+                }
+                if (attempt === 5) {
+                    return { response };
+                }
+                await response.body?.cancel();
+                return { response, delay };
+            };
+            const pending = isDownloadRequest ? downloadQueue.then(request) : request();
+            if (isDownloadRequest) {
+                downloadQueue = pending.then(() => {}, () => {});
+            }
+            const { response, delay } = await pending;
+            if (delay === undefined) {
                 return response;
             }
-            await response.body?.cancel();
-            const retryAfter = response.headers.get("retry-after")?.trim();
-            const requestedDelay = retryAfter === undefined
-                ? NaN
-                : /^\d+$/.test(retryAfter)
-                ? Number(retryAfter) * 1_000
-                : Date.parse(retryAfter) - Date.now();
-            if (requestedDelay > 2_147_483_647) {
-                throw new Error(`Retry-After exceeds the supported timer duration: ${url}`);
-            }
-            const delay = Number.isFinite(requestedDelay)
-                ? Math.max(0, requestedDelay)
-                : Math.ceil(Math.min(60_000, 1_000 * 2 ** attempt) * (0.5 + Math.random() / 2));
-            console.error(`Retrying ${url} in ${delay}ms (retry ${attempt + 1}/5, HTTP ${response.status})`);
+            logPackage(`Retrying ${url} in ${delay}ms (retry ${attempt + 1}/5, HTTP ${response.status})`);
             await wait(delay, signal ?? undefined);
         }
     };
@@ -65,6 +106,8 @@ export const npmFetch = createNpmFetch();
  * @typedef {{ typingsPackageName: string; libraryName: string; asOfVersion: string }} Removal
  * @typedef {Removal & { testCommand: string }} TestedRemoval
  * @typedef {{ path: string; error: string }} TestFailure
+ * @typedef {(name: string) => Promise<Record<string, unknown> | undefined>} TypesMetadataReader
+ * @typedef {{ shardIndex?: number; shardCount?: number; packageNames?: readonly string[]; readTypesMetadata?: TypesMetadataReader }} ScanOptions
  */
 
 /**
@@ -130,7 +173,7 @@ async function fetchJson(url, fetcher) {
         headers: { accept: "application/json" },
     });
     if (response.status === 404) {
-        console.error(`Skipping unavailable npm metadata: ${url}`);
+        logPackage(`Skipping unavailable npm metadata: ${url}`);
         return undefined;
     }
     if (!response.ok) {
@@ -147,45 +190,59 @@ async function fetchJson(url, fetcher) {
 }
 
 /**
- * @param {Record<string, unknown>} manifest
+ * @param {string} cache
+ * @param {(name: string, options: { cache: string; fullMetadata: true; offline?: boolean; preferOnline?: boolean }) => Promise<unknown>} readPackument
+ * @returns {TypesMetadataReader}
+ */
+export function createCachedTypesMetadata(cache, readPackument = pacote.packument) {
+    return async name => {
+        const metadata = await readPackument(name, { cache, fullMetadata: true, offline: true }).catch(error => {
+            if (!isRecord(error) || error.code !== "ENOTCACHED") {
+                throw error;
+            }
+            logPackage(`Fetching uncached npm metadata for ${name}`);
+            return readPackument(name, { cache, fullMetadata: true, preferOnline: true });
+        }).catch(error => {
+            if (!isRecord(error) || error.code !== "E404") {
+                throw error;
+            }
+            logPackage(`Skipping unavailable npm metadata: ${name}`);
+            return undefined;
+        });
+        if (metadata !== undefined && !isRecord(metadata)) {
+            throw new Error(`Invalid cached npm metadata for ${name}`);
+        }
+        return metadata;
+    };
+}
+
+/**
+ * @param {string} libraryName
+ * @param {string} version
  * @param {typeof fetch} fetcher
  */
-async function getPackageFiles(manifest, fetcher) {
-    if (!isRecord(manifest.dist) || typeof manifest.dist.tarball !== "string") {
-        throw new Error(`Missing npm tarball URL for ${manifest.name}@${manifest.version}`);
+async function getPackageFiles(libraryName, version, fetcher) {
+    const metadata = await fetchJson(`https://unpkg.com/${libraryName}@${version}/?meta`, fetcher);
+    if (!metadata) {
+        return undefined;
     }
-    const url = manifest.dist.tarball;
-    const response = await fetcher(url);
-    if (!response.ok) {
-        throw new Error(`Tarball request failed (${response.status} ${response.statusText}): ${url}`);
+    if (
+        metadata.package !== libraryName || metadata.version !== version || metadata.prefix !== "/"
+        || !Array.isArray(metadata.files)
+        || !metadata.files.every(file => isRecord(file) && typeof file.path === "string" && file.path.startsWith("/"))
+    ) {
+        throw new Error(`Invalid UNPKG metadata for ${libraryName}@${version}`);
     }
-    if (!response.body) {
-        throw new Error(`Missing tarball response body: ${url}`);
-    }
-
-    /** @type {string[]} */
-    const files = [];
-    await pipeline(
-        Readable.from(response.body),
-        list({
-            strict: true,
-            onReadEntry(entry) {
-                if (entry.type === "File" || entry.type === "OldFile") {
-                    files.push(entry.path.replace(/^\.\//, "").replace(/^[^/]+\//, ""));
-                }
-            },
-        }),
-        { signal: AbortSignal.timeout(30_000) },
-    );
-    return files;
+    return metadata.files.map(file => file.path.slice(1));
 }
 
 /**
  * @param {string} typingsPackageName
  * @param {typeof fetch} fetcher
+ * @param {TypesMetadataReader | undefined} readTypesMetadata
  * @returns {Promise<Removal | undefined>}
  */
-async function findRemoval(typingsPackageName, fetcher) {
+async function findRemoval(typingsPackageName, fetcher, readTypesMetadata) {
     const libraryName = typingsPackageName.includes("__")
         ? `@${typingsPackageName.replace("__", "/")}`
         : typingsPackageName;
@@ -198,7 +255,7 @@ async function findRemoval(typingsPackageName, fetcher) {
         throw new Error(`Invalid npm version for ${libraryName}: ${asOfVersion}`);
     }
     if (prerelease(asOfVersion)) {
-        console.error(`Skipping ${libraryName}: latest is a prerelease (${asOfVersion})`);
+        logPackage(`Skipping ${libraryName}: latest is a prerelease (${asOfVersion})`);
         return undefined;
     }
 
@@ -208,7 +265,7 @@ async function findRemoval(typingsPackageName, fetcher) {
             isRecord(dependencies) && Object.hasOwn(dependencies, typesName)
         )
     ) {
-        console.error(`Skipping ${libraryName}: its bundled types still depend on ${typesName}`);
+        logPackage(`Skipping ${libraryName}: its bundled types still depend on ${typesName}`);
         return undefined;
     }
 
@@ -223,21 +280,23 @@ async function findRemoval(typingsPackageName, fetcher) {
         throw new Error(`Invalid monthly download count for ${typesName}`);
     }
     if (downloads.downloads > maxMonthlyDownloads) {
-        console.error(`Skipping Popular or Critical package ${typesName} (${downloads.downloads} monthly downloads)`);
+        logPackage(`Skipping Popular or Critical package ${typesName} (${downloads.downloads} monthly downloads)`);
         return undefined;
     }
 
-    const typings = await fetchJson(`https://registry.npmjs.org/${encodeURIComponent(typesName)}`, fetcher);
+    const typings = readTypesMetadata
+        ? await readTypesMetadata(typesName)
+        : await fetchJson(`https://registry.npmjs.org/${encodeURIComponent(typesName)}`, fetcher);
     if (!typings) {
         return undefined;
     }
     const versions = publishedVersions(typings, typesName);
     if (versions.some(version => !gt(asOfVersion, version))) {
-        console.error(`Skipping ${libraryName}@${asOfVersion}: not newer than every published ${typesName} version`);
+        logPackage(`Skipping ${libraryName}@${asOfVersion}: not newer than every published ${typesName} version`);
         return undefined;
     }
-    const files = await getPackageFiles(manifest, fetcher);
-    if (!hasBundledTypes(libraryName, manifest, files)) {
+    const files = await getPackageFiles(libraryName, asOfVersion, fetcher);
+    if (!files || !hasBundledTypes(libraryName, manifest, files)) {
         return undefined;
     }
 
@@ -247,27 +306,47 @@ async function findRemoval(typingsPackageName, fetcher) {
 /**
  * @param {string} repoRoot
  * @param {typeof fetch} fetcher
+ * @param {ScanOptions} options
  */
-export async function findRemovals(repoRoot, fetcher = npmFetch) {
+export async function findRemovals(
+    repoRoot,
+    fetcher = npmFetch,
+    { shardIndex = 0, shardCount = 1, packageNames: includedNames, readTypesMetadata } = {},
+) {
+    if (
+        !Number.isSafeInteger(shardCount) || shardCount < 1
+        || !Number.isSafeInteger(shardIndex) || shardIndex < 0 || shardIndex >= shardCount
+    ) {
+        throw new Error("Expected 0 <= shardIndex < shardCount with a positive integer shardCount");
+    }
     const packageNames = readdirSync(join(repoRoot, "types"), { withFileTypes: true })
         .filter(entry => entry.isDirectory() && existsSync(join(repoRoot, "types", entry.name, "package.json")))
         .map(entry => entry.name)
         .sort()
         .filter(name => {
             const metadata = JSON.parse(readFileSync(join(repoRoot, "types", name, "package.json"), "utf8"));
-            return !metadata.nonNpm;
-        });
+            return !metadata.nonNpm && (!includedNames || includedNames.includes(name));
+        })
+        .filter(name => createHash("sha256").update(name).digest().readUInt32BE(0) % shardCount === shardIndex);
 
-    console.error(`Checking ${packageNames.length} npm-backed packages for bundled types...`);
+    console.error(
+        `Checking ${packageNames.length} npm-backed packages for bundled types (shard ${
+            shardIndex + 1
+        }/${shardCount})...`,
+    );
     /** @type {Removal[]} */
     const removals = [];
-    for (let start = 0; start < packageNames.length; start += 10) {
-        const batch = await Promise.all(packageNames.slice(start, start + 10).map(name => findRemoval(name, fetcher)));
-        for (const removal of batch) {
+    try {
+        for (const [index, name] of packageNames.entries()) {
+            packageProgress = `[${index + 1}/${packageNames.length}] `;
+            logPackage(`Checking @types/${name}`);
+            const removal = await findRemoval(name, fetcher, readTypesMetadata);
             if (removal) {
                 removals.push(removal);
             }
         }
+    } finally {
+        packageProgress = "";
     }
     return removals;
 }
@@ -462,15 +541,21 @@ export function pullRequestBody(removals) {
  * @param {string} repoRoot
  * @param {typeof fetch} fetcher
  * @param {string | undefined} pnpmPath
+ * @param {readonly string[] | undefined} packageNames
  */
-export async function main(repoRoot = root, fetcher = npmFetch, pnpmPath = process.env.npm_execpath) {
+export async function main(
+    repoRoot = root,
+    fetcher = npmFetch,
+    pnpmPath = process.env.npm_execpath,
+    packageNames = undefined,
+) {
     const status = execFileSync("git", ["status", "--porcelain"], { cwd: repoRoot, encoding: "utf8" });
     if (status.trim()) {
         throw new Error("Removing bundled types requires a clean working tree");
     }
 
     // Finish all registry checks before changing the checkout.
-    const removals = await findRemovals(repoRoot, fetcher);
+    const removals = await findRemovals(repoRoot, fetcher, { packageNames });
     if (!removals.length) {
         console.error("No packages to remove");
         return undefined;
@@ -548,8 +633,114 @@ export async function main(repoRoot = root, fetcher = npmFetch, pnpmPath = proce
     return pullRequestBody(testedRemovals);
 }
 
+/**
+ * @param {string} directory
+ * @param {string} commit
+ * @param {boolean} allowPartial
+ */
+function readCandidates(directory, commit, allowPartial = false) {
+    const files = readdirSync(directory, { withFileTypes: true })
+        .filter(entry => entry.isFile() && entry.name.endsWith(".json"));
+    const indices = new Set();
+    /** @type {Set<string>} */
+    const packages = new Set();
+    let shardCount;
+    for (const file of files) {
+        const scan = JSON.parse(readFileSync(join(directory, file.name), "utf8"));
+        if (
+            !isRecord(scan) || scan.commit !== commit
+            || typeof scan.shardCount !== "number" || !Number.isSafeInteger(scan.shardCount) || scan.shardCount < 1
+            || typeof scan.shardIndex !== "number" || !Number.isSafeInteger(scan.shardIndex)
+            || scan.shardIndex < 0 || scan.shardIndex >= scan.shardCount
+            || !Array.isArray(scan.packages)
+            || !scan.packages.every(name => typeof name === "string" && /^[a-z0-9][a-z0-9._-]*$/.test(name))
+        ) {
+            throw new Error(`Invalid scan result or mismatched checkout: ${file.name}`);
+        }
+        shardCount ??= scan.shardCount;
+        if (scan.shardCount !== shardCount || indices.has(scan.shardIndex)) {
+            throw new Error(`Inconsistent or duplicate scan shard: ${file.name}`);
+        }
+        indices.add(scan.shardIndex);
+        for (const name of scan.packages) {
+            if (packages.has(name)) {
+                throw new Error(`Duplicate package in scan results: ${name}`);
+            }
+            packages.add(name);
+        }
+    }
+    if (shardCount === undefined || (!allowPartial && indices.size !== shardCount)) {
+        throw new Error("Missing scan shard results");
+    }
+    return [...packages].sort();
+}
+
+/**
+ * @param {string[]} args
+ * @param {string} repoRoot
+ * @param {typeof fetch} fetcher
+ * @param {string | undefined} pnpmPath
+ */
+export async function runCli(
+    args = process.argv.slice(2),
+    repoRoot = root,
+    fetcher = npmFetch,
+    pnpmPath = process.env.npm_execpath,
+) {
+    const { values } = parseArgs({
+        args,
+        options: {
+            scan: { type: "boolean" },
+            "shard-index": { type: "string" },
+            "shard-count": { type: "string" },
+            candidates: { type: "string" },
+            "allow-partial": { type: "boolean" },
+            cache: { type: "string" },
+        },
+    });
+    if (values.candidates !== undefined && !values.candidates.trim()) {
+        throw new Error("--candidates requires a non-empty directory path");
+    }
+    if (values.scan && values.candidates !== undefined) {
+        throw new Error("--scan and --candidates cannot be combined");
+    }
+    if (values["allow-partial"] && values.candidates === undefined) {
+        throw new Error("--allow-partial requires --candidates");
+    }
+    if (
+        !values.scan
+        && (values.cache !== undefined || values["shard-index"] !== undefined || values["shard-count"] !== undefined)
+    ) {
+        throw new Error("Cache and shard options require --scan");
+    }
+    if (values.scan || values.candidates !== undefined) {
+        const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim();
+        if (values.scan) {
+            const shardIndex = Number(values["shard-index"] ?? 0);
+            const shardCount = Number(values["shard-count"] ?? 1);
+            const readTypesMetadata = values.cache === undefined ? undefined : createCachedTypesMetadata(values.cache);
+            const removals = await findRemovals(repoRoot, fetcher, { shardIndex, shardCount, readTypesMetadata });
+            return JSON.stringify({
+                commit,
+                shardIndex,
+                shardCount,
+                packages: removals.map(removal => removal.typingsPackageName),
+            });
+        }
+        if (values.candidates !== undefined) {
+            return main(
+                repoRoot,
+                fetcher,
+                pnpmPath,
+                readCandidates(values.candidates, commit, values["allow-partial"]),
+            );
+        }
+    }
+    return main(repoRoot, fetcher, pnpmPath);
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-    main().then(body => {
+    runCli().then(body => {
         if (body) {
             console.log(body);
         }
