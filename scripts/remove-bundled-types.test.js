@@ -1018,6 +1018,7 @@ test("rejects failed requests and malformed registry data", async t => {
     for (
         const [url, response, error] of [
             ["https://registry.npmjs.org/invalid/latest", new Response(null, { status: 429 }), /Request failed \(429/],
+            ["https://registry.npmjs.org/invalid/latest", new Response(null, { status: 503 }), /Request failed \(503/],
             ["https://registry.npmjs.org/invalid/latest", [], /Expected an object/],
             [
                 "https://registry.npmjs.org/invalid/latest",
@@ -1052,12 +1053,43 @@ test("skips unavailable UNPKG metadata and empty file lists", async t => {
     assert.deepEqual(await findRemovals(root, fetcher), []);
 });
 
-test("rejects failed, malformed, or mismatched UNPKG metadata", async t => {
+test("skips UNPKG server errors after retries and continues scanning other packages", async context => {
+    const logger = context.mock.method(console, "error", () => {});
+    const url = "https://unpkg.com/jsdeferred@0.4.0/?meta";
+    for (const status of [500, 502, 503, 504, 599]) {
+        const root = fixture(context, { jsdeferred: {}, working: {} });
+        const { fetcher, requests } = mockRegistry({
+            ...npmResponses("jsdeferred", { version: "0.4.0", versions: ["0.3.0"] }),
+            ...npmResponses("working"),
+        });
+        let attempts = 0;
+        const client = createNpmFetch(async (input, options) => {
+            if (requestUrl(input) === url) {
+                attempts++;
+                return new Response("UNPKG server error", { status, headers: { "Retry-After": "0" } });
+            }
+            return fetcher(input, options);
+        }, async () => {});
+        assert.deepEqual(await findRemovals(root, client), [
+            { typingsPackageName: "working", libraryName: "working", asOfVersion: "2.0.0" },
+        ]);
+        assert.equal(attempts, status === 599 ? 1 : 6);
+        assert.ok(requests.includes("https://unpkg.com/working@2.0.0/?meta"));
+        assert.ok(
+            logger.mock.calls.some(call =>
+                call.arguments[0] === `[1/2] Skipping unavailable metadata (HTTP ${status}): ${url}`
+            ),
+        );
+    }
+});
+
+test("rejects other failed, malformed, or mismatched UNPKG metadata", async t => {
     const url = "https://unpkg.com/invalid@2.0.0/?meta";
     const metadata = { package: "invalid", version: "2.0.0", prefix: "/", files: [{ path: "/index.d.ts" }] };
     for (
         const [response, error] of [
-            [new Response(null, { status: 503 }), /Request failed \(503/],
+            [new Response(null, { status: 400 }), /Request failed \(400/],
+            [new Response(null, { status: 429 }), /Request failed \(429/],
             [new Response(null), /Missing JSON response body/],
             [new Response("not JSON"), /JSON|Unexpected token/],
             [[], /Expected an object/],
