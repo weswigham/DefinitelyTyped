@@ -16,7 +16,6 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-slim
-    if: github.repository == 'DefinitelyTyped/DefinitelyTyped'
     outputs:
       commit: ${{ steps.commit.outputs.commit }}
     steps:
