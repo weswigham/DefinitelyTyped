@@ -167,13 +167,15 @@ export function hasBundledTypes(libraryName, manifest, fileNames) {
 /**
  * @param {string} url
  * @param {typeof fetch} fetcher
+ * @param {boolean} skipServerErrors
  */
-async function fetchJson(url, fetcher) {
+async function fetchJson(url, fetcher, skipServerErrors = false) {
     const response = await fetcher(url, {
         headers: { accept: "application/json" },
     });
-    if (response.status === 404) {
-        logPackage(`Skipping unavailable npm metadata: ${url}`);
+    if (response.status === 404 || (skipServerErrors && response.status >= 500 && response.status < 600)) {
+        logPackage(`Skipping unavailable metadata (HTTP ${response.status}): ${url}`);
+        await response.body?.cancel();
         return undefined;
     }
     if (!response.ok) {
@@ -222,7 +224,7 @@ export function createCachedTypesMetadata(cache, readPackument = pacote.packumen
  * @param {typeof fetch} fetcher
  */
 async function getPackageFiles(libraryName, version, fetcher) {
-    const metadata = await fetchJson(`https://unpkg.com/${libraryName}@${version}/?meta`, fetcher);
+    const metadata = await fetchJson(`https://unpkg.com/${libraryName}@${version}/?meta`, fetcher, true);
     if (!metadata) {
         return undefined;
     }
