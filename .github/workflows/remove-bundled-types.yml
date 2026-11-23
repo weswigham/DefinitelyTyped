@@ -75,7 +75,6 @@ jobs:
       contents: write
       pull-requests: write
     runs-on: ubuntu-latest
-    if: github.repository == 'DefinitelyTyped/DefinitelyTyped'
     timeout-minutes: 360
 
     steps:
