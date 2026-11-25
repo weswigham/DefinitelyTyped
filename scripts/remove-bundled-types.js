@@ -400,10 +400,11 @@ function runPnpm(repoRoot, pnpmPath, args, allowFailure = false) {
  * @param {string} repoRoot
  * @param {string} pnpmPath
  * @param {string} reportPath
+ * @param {string} diffBase
  */
-function runAffectedTests(repoRoot, pnpmPath, reportPath) {
+function runAffectedTests(repoRoot, pnpmPath, reportPath, diffBase) {
     rmSync(reportPath, { force: true });
-    const args = ["run", "test-all", "--selection", "affected", "--diffBase", "HEAD", "--writeFailures", reportPath];
+    const args = ["run", "test-all", "--selection", "affected", "--diffBase", diffBase, "--writeFailures", reportPath];
     const passed = runPnpm(repoRoot, pnpmPath, args, true);
     const command = ["pnpm", ...args].map(arg => /\s/.test(arg) ? JSON.stringify(arg) : arg).join(" ");
     if (!existsSync(reportPath)) {
@@ -534,7 +535,7 @@ export function pullRequestBody(removals) {
     return [
         ...lines,
         "",
-        "Each removal passed DT's affected-package tests before its commit, including any downstream dependency pins.",
+        "Each removal commit passed DT's affected-package tests against its parent, including any downstream dependency pins.",
         "",
     ].join("\n");
 }
@@ -573,6 +574,7 @@ export async function main(
         );
         /** @type {import("node:child_process").ExecFileSyncOptions} */
         const options = { cwd: repoRoot, stdio: ["ignore", 2, 2] };
+        const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim();
         const changedFiles = new Set([
             join("types", removal.typingsPackageName),
             "notNeededPackages.json",
@@ -581,27 +583,10 @@ export async function main(
         const reportDirectory = mkdtempSync(join(tmpdir(), "dt-removal-tests-"));
         const reportPath = join(reportDirectory, "failures.json");
         let committed = false;
+        let validated = false;
         try {
             runPnpm(repoRoot, pnpmPath, notNeededArgs(removal));
             runPnpm(repoRoot, pnpmPath, ["install"]);
-            let tests = runAffectedTests(repoRoot, pnpmPath, reportPath);
-            if (!tests.passed) {
-                const pins = await dependencyPins(repoRoot, tests.failures, removal, fetcher);
-                for (const pin of pins) {
-                    changedFiles.add(pin.file);
-                    writeFileSync(join(repoRoot, pin.file), pin.content, "utf8");
-                }
-                if (pins.length) {
-                    runPnpm(repoRoot, pnpmPath, ["install"]);
-                }
-                tests = runAffectedTests(repoRoot, pnpmPath, reportPath);
-            }
-            if (!tests.passed) {
-                console.error(
-                    `Skipping @types/${removal.typingsPackageName}: DT tests still fail after dependency pins`,
-                );
-                continue;
-            }
             execFileSync("git", ["add", "--", ...changedFiles], options);
             execFileSync(
                 "git",
@@ -613,13 +598,37 @@ export async function main(
                 options,
             );
             committed = true;
+            let tests = runAffectedTests(repoRoot, pnpmPath, reportPath, base);
+            if (!tests.passed) {
+                const pins = await dependencyPins(repoRoot, tests.failures, removal, fetcher);
+                for (const pin of pins) {
+                    changedFiles.add(pin.file);
+                    writeFileSync(join(repoRoot, pin.file), pin.content, "utf8");
+                }
+                if (pins.length) {
+                    runPnpm(repoRoot, pnpmPath, ["install"]);
+                    execFileSync("git", ["add", "--", ...pins.map(pin => pin.file)], options);
+                    execFileSync("git", ["commit", "--amend", "--no-edit"], options);
+                }
+                tests = runAffectedTests(repoRoot, pnpmPath, reportPath, base);
+            }
+            if (!tests.passed) {
+                console.error(
+                    `Skipping @types/${removal.typingsPackageName}: DT tests still fail after dependency pins`,
+                );
+                continue;
+            }
+            validated = true;
             testedRemovals.push({ ...removal, testCommand: tests.command });
         } finally {
             try {
-                if (!committed) {
+                if (!validated) {
+                    if (committed) {
+                        execFileSync("git", ["reset", "--soft", base], options);
+                    }
                     execFileSync(
                         "git",
-                        ["restore", "--source=HEAD", "--staged", "--worktree", "--", ...changedFiles],
+                        ["restore", `--source=${base}`, "--staged", "--worktree", "--", ...changedFiles],
                         options,
                     );
                 }
