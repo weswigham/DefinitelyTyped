@@ -70,11 +70,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 const cp = require("node:child_process");
 const args = process.argv.slice(2);
+assert.equal(cp.execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" }).trim(), "");
 assert.equal(args[args.indexOf("--selection") + 1], "affected");
-assert.equal(args[args.indexOf("--diffBase") + 1], "HEAD");
+const diffBase = args[args.indexOf("--diffBase") + 1];
+assert.equal(diffBase, cp.execFileSync("git", ["rev-parse", "HEAD^"], { encoding: "utf8" }).trim());
 const report = args[args.indexOf("--writeFailures") + 1];
 assert.ok(report);
-const previous = JSON.parse(cp.execFileSync("git", ["show", "HEAD:notNeededPackages.json"], { encoding: "utf8" })).packages;
+const previous = JSON.parse(cp.execFileSync("git", ["show", diffBase + ":notNeededPackages.json"], { encoding: "utf8" })).packages;
 const current = JSON.parse(fs.readFileSync("notNeededPackages.json", "utf8")).packages;
 const removed = Object.keys(current).filter(name => !(name in previous));
 assert.equal(removed.length, 1);
@@ -1147,15 +1149,15 @@ test("creates one real not-needed commit per removal and a combined inline PR bo
     const commits = git(root, "rev-list", "--reverse", `${base}..HEAD`).split("\n");
     const testRuns = commands(root).filter(command => command.args[1] === "test-all");
     assert.equal(testRuns.length, 2);
-    assert.deepEqual(testRuns.map(command => command.head), [base, commits[0]]);
-    for (const command of testRuns) {
+    assert.deepEqual(testRuns.map(command => command.head), commits);
+    for (const [index, command] of testRuns.entries()) {
         assert.deepEqual(command.args.slice(0, 6), [
             "run",
             "test-all",
             "--selection",
             "affected",
             "--diffBase",
-            "HEAD",
+            index === 0 ? base : commits[index - 1],
         ]);
         assert.equal(existsSync(command.args[7]), false);
     }
@@ -1171,10 +1173,10 @@ test("creates one real not-needed commit per removal and a combined inline PR bo
     assert.ok(body);
     assert.match(body, /`pnpm run not-needed first\.test 2\.0\.0` - passed/);
     assert.match(body, /`pnpm run not-needed scope__second 2\.0\.0 @scope\/second` - passed/);
-    assert.match(body, /`pnpm run test-all --selection affected --diffBase HEAD --writeFailures .+` - passed/);
+    assert.match(body, /`pnpm run test-all --selection affected --diffBase [a-f0-9]+ --writeFailures .+` - passed/);
 });
 
-test("pins only failing downstream packages, preserves ranges and legacy versions, and retests before committing", async t => {
+test("pins only failing downstream packages, preserves ranges and legacy versions, and amends before retesting", async t => {
     const root = fixture(t, {
         first: {},
         consumer: {
@@ -1218,7 +1220,11 @@ test("pins only failing downstream packages, preserves ranges and legacy version
         ["install"],
         ["run", "test-all"],
     ]);
-    assert.ok(executed.every(command => command.head === base));
+    const testRuns = executed.filter(command => command.args[1] === "test-all");
+    assert.notEqual(testRuns[0].head, base);
+    assert.notEqual(testRuns[1].head, testRuns[0].head);
+    assert.equal(testRuns[1].head, git(root, "rev-parse", "HEAD"));
+    assert.ok(testRuns.every(command => command.args[5] === base));
     assert.equal(git(root, "rev-list", "--count", `${base}..HEAD`), "1");
     const committedFiles = git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").split("\n");
     assert.ok(committedFiles.includes("types/consumer/package.json"));
